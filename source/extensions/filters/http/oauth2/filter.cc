@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <openssl/rand.h>
 
 #include "source/common/common/assert.h"
 #include "source/common/common/empty_string.h"
@@ -392,6 +393,15 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
     return Http::FilterHeadersStatus::StopIteration;
   }
 
+  // Get the state from the cookie
+  const auto cookies = Http::Utility::parseCookies(headers);
+  auto state_cookie_it = cookies.find("oauth2_state");
+  if (state_cookie_it == cookies.end()) {
+    ENVOY_LOG(error, "OAuth2 state cookie not found");
+    sendUnauthorizedResponse();
+    return Http::FilterHeadersStatus::StopIteration;
+  }
+
   auth_code_ = codeVal.value();
   if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.oauth_use_url_encoding")) {
     state_ = Http::Utility::PercentEncoding::urlDecodeQueryParameter(stateVal.value());
@@ -399,8 +409,9 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
     state_ = Http::Utility::PercentEncoding::decode(stateVal.value());
   }
 
-  Http::Utility::Url state_url;
-  if (!state_url.initialize(state_, false)) {
+  // Verify that the state in the callback matches the state in the cookie
+  if (state_ != state_cookie_it->second) {
+    ENVOY_LOG(error, "OAuth2 state mismatch");
     sendUnauthorizedResponse();
     return Http::FilterHeadersStatus::StopIteration;
   }
@@ -456,11 +467,11 @@ void OAuth2Filter::redirectToOAuthServer(Http::RequestHeaderMap& headers) const 
   }
 
   const std::string base_path = absl::StrCat(scheme, "://", host_);
-  const std::string state_path = absl::StrCat(base_path, headers.Path()->value().getStringView());
-  const std::string escaped_state =
-      Runtime::runtimeFeatureEnabled("envoy.reloadable_features.oauth_use_url_encoding")
-          ? Http::Utility::PercentEncoding::urlEncodeQueryParameter(state_path)
-          : Http::Utility::PercentEncoding::encode(state_path, ":/=&?");
+
+  // Generate nonce for state param
+  const std::string nonce = generateRandomNonce();
+  // Set the state cookie
+  setStateCookie(response_headers.get(), nonce);
 
   Formatter::FormatterImpl formatter(config_->redirectUri());
   const auto redirect_uri =
@@ -472,7 +483,7 @@ void OAuth2Filter::redirectToOAuthServer(Http::RequestHeaderMap& headers) const 
 
   auto query_params = config_->authorizationQueryParams();
   query_params.overwrite("redirect_uri", escaped_redirect_uri);
-  query_params.overwrite("state", escaped_state);
+  query_params.overwrite("state", nonce);
   // Copy the authorization endpoint URL to replace its query params.
   auto authorization_endpoint_url = config_->authorizationEndpointUrl();
   const std::string path_and_query_params = query_params.replaceQueryString(
@@ -523,6 +534,19 @@ void OAuth2Filter::updateTokens(const std::string& access_token, const std::stri
   new_expires_ = std::to_string(
       std::chrono::duration_cast<std::chrono::seconds>(new_epoch.time_since_epoch()).count());
 }
+
+std::string OAuth2Filter::generateRandomNonce() const {
+  unsigned char random_bytes[32];
+  RAND_bytes(random_bytes, sizeof(random_bytes));
+  return absl::Base64Escape(absl::string_view(reinterpret_cast<const char*>(random_bytes), sizeof(random_bytes)));
+}
+
+void OAuth2Filter::setStateCookie(Http::ResponseHeaderMap* headers, const std::string& state) const {
+  const std::string cookie_value = absl::StrCat("oauth2_state=", state,
+                                                "; Path=/; Max-Age=600; Secure; SameSite=Strict; HttpOnly");
+  headers->addReferenceKey(Http::Headers::get().SetCookie, cookie_value);
+}
+
 
 std::string OAuth2Filter::getEncodedToken() const {
   auto token_secret = config_->tokenSecret();

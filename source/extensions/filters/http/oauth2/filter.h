@@ -298,6 +298,9 @@ private:
 
   Http::FilterHeadersStatus signOutUser(const Http::RequestHeaderMap& headers);
 
+  std::string generateRandomNonce() const;
+  void setStateCookie(Http::ResponseHeaderMap* headers, const std::string& state) const;
+
   std::string getEncodedToken() const;
   void addResponseCookies(Http::ResponseHeaderMap& headers, const std::string& encoded_token) const;
   const std::string& bearerPrefix() const;
